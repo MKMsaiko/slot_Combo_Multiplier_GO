@@ -38,7 +38,7 @@
   <br><sub>RTP、獎項分佈等主要遊戲表現</sub>
 </p>
 
-## Python腳本生成圖檔示意
+## Python腳本生成圖檔範例
 <p align="center">
   <img src="image/fg_peak_mult_hist.png" width="700" alt="模擬輸出截圖">
 </p>
