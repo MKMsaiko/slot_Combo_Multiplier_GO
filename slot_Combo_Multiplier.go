@@ -12,7 +12,7 @@ Wild皆出現在2-5轉輪，可替代除Scatter外之任意符號
 賠率表以1024 ways總押注1作計算
 
 程式流程：
-依處理器thread數 → 分數個worker → 各自做以下1-7 → 彙整輸出
+依處理器thread數 → 分數個worker → 各自做以下1-7 → 彙整輸出(含CSV)
 
 1. 主遊戲初轉（MG）
 
@@ -77,23 +77,34 @@ Wild皆出現在2-5轉輪，可替代除Scatter外之任意符號
 	END 使用次數與第一次 END_Refill 切入轉數回傳給 worker。
 	worker 把本段 FG 的贏分（res.total）、spins、retri、END 統計等，累加到自己的 local Stats。
 
-6. 單把結果累計與分層
+6. worker 端累計單把結果與分層統計
 
-	該把總贏分 spinTotal = mgWin + fgWin。
-	依 spinTotal/bet ，更新 Big/Mega/Super/Holy/Jumbo/Jojo 分層與 maxSingleSpin。
+	對每一把：
+	    spinTotal = mgWin + fgWin。
+	    依 spinTotal / bet 分類為 Big / Mega / Super / Holy / Jumbo / Jojo，並更新 maxSingleSpin。
+	    若有 FG，則累加 freeWinSum、totalFGSpins、retriggerCount、triggerCount 等統計。
+	    若 MG 完全無贏分且未觸發 FG，則 deadSpins++。
 
-7. 進度心跳
+7. 進度心跳（跨 worker）
 
-	每轉 bumpCnt++，4096 轉做一次 atomic.AddInt64(&spinsDone, 4096)。
+	每個 worker 在迴圈內累計 bumpCnt，每跑滿 4096 轉時：
+	    呼叫 spinsDone.addAndGet(4096) 更新已完成總轉數，並將 bumpCnt 歸零。
+
+	獨立的 progressThread：
+	    每秒讀取 spinsDone，計算目前完成比例、模擬速度與預估剩餘時間。
 */
 package main
 
 import (
+	"encoding/csv"
 	"fmt"
 	"log"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -129,12 +140,11 @@ var (
  * 常數
  **************/
 const (
-	reelsCount = 5
-	rows       = 4
-	numWays    = 1024
-	minPayLen  = 3
-	maxLen     = 5
-
+	reelsCount      = 5
+	rows            = 4
+	numWays         = 1024
+	minPayLen       = 3
+	maxLen          = 5
 	maxFGTotalSpins = 50
 )
 
@@ -871,6 +881,235 @@ type Stats struct {
 	fgInitLenCount [NumSymbols][3]int64
 }
 
+// .CSV Path
+const outputDir = "csv"
+
+// .CSV tool
+func writeAllCSVs(
+	outputDir string,
+	totalSpins int64,
+	s Stats,
+) error {
+	// 建資料夾（若已存在不會出錯）
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return err
+	}
+
+	// FG 逐轉總筆數（當作 FG combo 分布的分母）
+	var fgSpinCount int64
+	for c := 0; c <= 20; c++ {
+		fgSpinCount += s.fgComboHist[c]
+	}
+
+	// 1. MG combo hist（每把）
+	if err := writeComboHistCSV(
+		filepath.Join(outputDir, "mg_combo_hist.csv"),
+		s.mgComboHist,
+		float64(totalSpins),
+	); err != nil {
+		return err
+	}
+
+	// 2. FG combo hist（逐轉）
+	if err := writeComboHistCSV(
+		filepath.Join(outputDir, "fg_combo_hist.csv"),
+		s.fgComboHist,
+		float64(fgSpinCount),
+	); err != nil {
+		return err
+	}
+
+	// 3. 每段 FG 的實際總場次分布（1..50）
+	if err := writeFGSegLenHistCSV(
+		filepath.Join(outputDir, "fg_segment_length_hist.csv"),
+		s.fgSegLenHist,
+		s.triggerCount,
+	); err != nil {
+		return err
+	}
+
+	// 4. 每段 FG 的 peak 倍率分布（1..50）
+	if err := writePeakMultHistCSV(
+		filepath.Join(outputDir, "fg_peak_mult_hist.csv"),
+		s.peakMultHist,
+		s.triggerCount,
+	); err != nil {
+		return err
+	}
+
+	// 5. 各符號 3/4/5 連次數（MG/FG）
+	if err := writeSymbolLenCSV(
+		filepath.Join(outputDir, "mg_symbol_len_counts.csv"),
+		s.mgLenCount,
+	); err != nil {
+		return err
+	}
+	if err := writeSymbolLenCSV(
+		filepath.Join(outputDir, "fg_symbol_len_counts.csv"),
+		s.fgLenCount,
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// 1.2. combo hist（MG/FG 共用）
+func writeComboHistCSV(
+	filename string,
+	hist [21]int64,
+	denominator float64, // MG 用總轉數；FG 用 fgSpinCount
+) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	if err := w.Write([]string{"combo", "count", "ratio"}); err != nil {
+		return err
+	}
+
+	for c := 0; c <= 20; c++ {
+		count := hist[c]
+		ratio := 0.0
+		if denominator > 0 {
+			ratio = float64(count) / denominator
+		}
+		row := []string{
+			strconv.Itoa(c),
+			strconv.FormatInt(count, 10),
+			strconv.FormatFloat(ratio, 'f', 8, 64),
+		}
+		if err := w.Write(row); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// 3. 每段 FG 的實際總場次分布
+func writeFGSegLenHistCSV(
+	filename string,
+	hist [51]int64, // 0..50，用 1..maxFGTotalSpins
+	triggerCount int64,
+) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	if err := w.Write([]string{"len", "count", "prob_per_trigger"}); err != nil {
+		return err
+	}
+
+	den := float64(triggerCount)
+	for l := 1; l <= maxFGTotalSpins; l++ {
+		count := hist[l]
+		if count == 0 {
+			continue
+		}
+		p := 0.0
+		if den > 0 {
+			p = float64(count) / den
+		}
+		row := []string{
+			strconv.Itoa(l),
+			strconv.FormatInt(count, 10),
+			strconv.FormatFloat(p, 'f', 8, 64),
+		}
+		if err := w.Write(row); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// 4. 每段 FG peak 倍率分布
+func writePeakMultHistCSV(
+	filename string,
+	hist [51]int64, // 0..50，實際用 1..50
+	triggerCount int64,
+) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	if err := w.Write([]string{"multiplier", "count", "prob_per_trigger"}); err != nil {
+		return err
+	}
+
+	den := float64(triggerCount)
+	for m := 1; m <= 50; m++ {
+		count := hist[m]
+		if count == 0 {
+			continue
+		}
+		p := 0.0
+		if den > 0 {
+			p = float64(count) / den
+		}
+		row := []string{
+			strconv.Itoa(m),
+			strconv.FormatInt(count, 10),
+			strconv.FormatFloat(p, 'f', 8, 64),
+		}
+		if err := w.Write(row); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// 5. 各符號 3/4/5 連次數（MG/FG）
+func writeSymbolLenCSV(
+	filename string,
+	lenCount [NumSymbols][3]int64,
+) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	if err := w.Write([]string{"symbol", "len3_count", "len4_count", "len5_count"}); err != nil {
+		return err
+	}
+
+	// 只統計 9~R，不含 Wild / Scatter：
+	symbols := []int{int(S9), int(S10), int(SJ), int(SQ), int(SK), int(SB), int(SF), int(SR)}
+
+	for _, t := range symbols {
+		row := []string{
+			symLabel(t),
+			strconv.FormatInt(lenCount[t][0], 10),
+			strconv.FormatInt(lenCount[t][1], 10),
+			strconv.FormatInt(lenCount[t][2], 10),
+		}
+		if err := w.Write(row); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 /**************
  * 心跳
  **************/
@@ -1315,6 +1554,15 @@ func main() {
 	for _, t := range []int{int(S9), int(S10), int(SJ), int(SQ), int(SK), int(SB), int(SF), int(SR)} {
 		c3, c4, c5 := total.fgLenCount[t][0], total.fgLenCount[t][1], total.fgLenCount[t][2]
 		fmt.Printf("  %-2s : 3連=%12d  4連=%12d  5連=%12d\n", symLabel(t), c3, c4, c5)
+	}
+
+	// === CSV ===
+	if err := writeAllCSVs(
+		outputDir,
+		numSpins,
+		total,
+	); err != nil {
+		log.Printf("寫入 CSV 發生錯誤: %v", err)
 	}
 }
 
